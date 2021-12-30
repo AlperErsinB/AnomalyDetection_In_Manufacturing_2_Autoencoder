@@ -1,0 +1,282 @@
+def create_tensor(self, data_sample, signal_names, start, end, window_size, stride=8):
+“””Create a tensor from a cut sample. Final tensor will have shape:
+[# samples, # sample len, # features/sample]
+Parameters
+===========
+data_sample : ndarray
+single data sample (individual cut) containing all the signals
+signal_names : tuple
+tuple of all the signals that will be added into the tensor
+start : int
+starting index (e.g. the first 2000 “samples” in the cut may be from
+when the tool is not up to speed, so should be ignored)
+end : int
+ending index
+window_size : int
+size of the window to be used to make the sub-cuts
+stride : int
+length to move the window at each iteration
+Returns
+===========
+c : ndarray
+array of the sub-cuts
+“””
+s = signal_names[::-1] # only include the six signals, and reverse order
+c = data_sample[s[0]].reshape((9000, 1))
+for i in range(len(s)):
+try:
+a = data_sample[s[i + 1]].reshape((9000, 1)) # reshape to make sure
+c = np.hstack((a, c)) # horizontal stack
+except:
+# reshape into [# samples, # sample len, # features/sample]
+c = c[start:end]
+c = np.reshape(c, (c.shape[0], -1))
+dummy_array = []
+# fit the strided windows into the dummy_array until the length
+# of the window does not equal the proper length
+for i in range(c.shape[0]):
+windowed_signal = c[i * stride : i * stride + window_size]
+if windowed_signal.shape == (window_size, 6):
+dummy_array.append(windowed_signal)
+else:
+break
+c = np.array(dummy_array)
+return c
+
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from pathlib import Path
+from sklearn.model_selection import train_test_split
+import data_prep
+data_file = folder_raw_data / “mill.mat”
+# helper functions needed in the data processing
+def scaler(x, min_val_array, max_val_array):
+‘’’Scale an array across all dimensions’’’
+# get the shape of the array
+s, _, sub_s = np.shape(x)
+for i in range(s):
+for j in range(sub_s):
+x[i,:,j] = np.divide((x[i,:,j] — min_val_array[j]), np.abs(max_val_array[j] — min_val_array[j]))
+return x
+# min-max function
+def get_min_max(x):
+‘’’Get the minimum and maximum values for each
+dimension in an array’’’
+# flatten the input array http://bit.ly/2MQuXZd
+flat_vector = np.concatenate(x)
+min_vals = np.min(flat_vector,axis=0)
+max_vals = np.max(flat_vector,axis=0)
+return min_vals, max_vals
+# use the DataPrep module to load the data
+prep = data_prep.DataPrep(data_file)
+# load the labeled CSV (NaNs filled in by hand)
+df_labels = pd.read_csv(folder_processed_data / “labels_with_tool_class.csv”)
+# Save regular data set. The X_train, X_val, X_test will be used for anomaly detection
+# discard certain cuts as they are strange
+cuts_remove = [17, 94]
+df_labels.drop(cuts_remove, inplace=True)
+# use the return_xy function to take the milling data, select the stable cutting region,
+# and apply the window/stride
+X, y = prep.return_xy(df_labels, prep.data,prep.field_names[7:],window_size=64, stride=64)
+# use sklearn train_test_split function
+# use stratify to ensure that the distribution of classes is equal
+# between each of the data sets
+X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.33, random_state=15, stratify=y)
+X_val, X_test, y_val, y_test = train_test_split(X_test, y_test, test_size=0.50, random_state=10, stratify=y_test)
+# get the min/max values from each dim in the X_train
+min_vals, max_vals = get_min_max(X_train)
+# scale the train/val/test with the above min/max values
+X_train = scaler(X_train, min_vals, max_vals)
+X_val = scaler(X_val, min_vals, max_vals)
+X_test = scaler(X_test, min_vals, max_vals)
+# training/validation of VAE is only done on healthy (class 0)
+# data samples, so we must remove classes 1, 2 from the train/val
+# data sets
+X_train_slim, y_train_slim = prep.remove_classes(
+[1,2], y_train, X_train
+)
+X_val_slim, y_val_slim = prep.remove_classes(
+[1,2], y_val, X_val
+)
+print(“\nShape of X_train:”, X_train.shape)
+print(“Shape of y_train:”, y_train.shape, end=’\n\n’)
+# function to show the percentage of labels in y-labels
+def y_shape_percentage(y_train, label):
+l = y_train
+print(‘shape {}:’.format(label), l.shape,
+‘\t\t0: {:.1%}’.format(len(l[l == 0])/len(l)),
+‘\t\t1: {:.1%}’.format(len(l[l == 1])/len(l)),
+‘\t\t2: {:.1%}’.format(len(l[l == 2])/len(l)))
+# let’s see what percentage of the data set splits are made up of healthy (0), degraded (1),
+# and failed (2) labels
+y_shape_percentage(y_train, ‘y_train’)
+y_shape_percentage(y_val, ‘y_val’)
+y_shape_percentage(y_test, ‘y_test’)
+
+
+
+K = keras.backend
+# class for sampling embeddings in the latent space
+class Sampling(keras.layers.Layer):
+def call(self, inputs):
+mean, log_var = inputs
+return K.random_normal(tf.shape(log_var)) * K.exp(log_var / 2) + mean
+# rounded accuracy for the metric
+def rounded_accuracy(y_true, y_pred):
+return keras.metrics.binary_accuracy(tf.round(y_true), tf.round(y_pred))
+# fit the model
+def model_fit(
+X_train_slim,
+X_val_slim,
+beta_value=1.25,
+codings_size=10,
+dilations=[1, 2, 4],
+conv_layers=1,
+seed=31,
+start_filter_no=32,
+kernel_size_1=2,
+epochs=10,
+earlystop_patience=8,
+verbose=0,
+compile_model_only=False,
+):
+_, window_size, feat = X_train_slim.shape
+# save the time model training began
+# this way we can identify trained model at the end
+date_time = datetime.datetime.now().strftime(“%Y%m%d-%H%M%S”)
+# set random seeds so we can somewhat reproduce results
+tf.random.set_seed(seed)
+np.random.seed(seed)
+end_filter_no = start_filter_no
+inputs = keras.layers.Input(shape=[window_size, feat])
+z = inputs
+#### ENCODER ####
+for i in range(0, conv_layers):
+z = TCN(
+nb_filters=start_filter_no,
+kernel_size=kernel_size_1,
+nb_stacks=1,
+dilations=dilations,
+padding=”causal”,
+use_skip_connections=True,
+dropout_rate=0.0,
+return_sequences=True,
+activation=”selu”,
+kernel_initializer=”he_normal”,
+use_batch_norm=False,
+use_layer_norm=False,
+)(z)
+z = keras.layers.BatchNormalization()(z)
+z = keras.layers.MaxPool1D(pool_size=2)(z)
+z = keras.layers.Flatten()(z)
+print(“Shape of Z:”, z.shape)
+codings_mean = keras.layers.Dense(codings_size)(z)
+codings_log_var = keras.layers.Dense(codings_size)(z)
+codings = Sampling()([codings_mean, codings_log_var])
+variational_encoder = keras.models.Model(
+inputs=[inputs], outputs=[codings_mean, codings_log_var, codings]
+)
+#### DECODER ####
+decoder_inputs = keras.layers.Input(shape=[codings_size])
+x = keras.layers.Dense(
+start_filter_no * int((window_size / (2 ** conv_layers))), activation=”selu”
+)(decoder_inputs)
+x = keras.layers.Reshape(
+target_shape=((int(window_size / (2 ** conv_layers))), end_filter_no)
+)(x)
+for i in range(0, conv_layers):
+x = keras.layers.UpSampling1D(size=2)(x)
+x = keras.layers.BatchNormalization()(x)
+x = TCN(
+nb_filters=start_filter_no,
+kernel_size=kernel_size_1,
+nb_stacks=1,
+dilations=dilations,
+padding=”causal”,
+use_skip_connections=True,
+dropout_rate=0.0,
+return_sequences=True,
+activation=”selu”,
+kernel_initializer=”he_normal”,
+use_batch_norm=False,
+use_layer_norm=False,
+)(x)
+outputs = keras.layers.Conv1D(
+feat, kernel_size=kernel_size_1, padding=”same”, activation=”sigmoid”
+)(x)
+variational_decoder = keras.models.Model(inputs=[decoder_inputs], outputs=[outputs])
+_, _, codings = variational_encoder(inputs)
+reconstructions = variational_decoder(codings)
+variational_ae_beta = keras.models.Model(inputs=[inputs], outputs=[reconstructions])
+latent_loss = (
+-0.5
+* beta_value
+* K.sum(
+1 + codings_log_var — K.exp(codings_log_var) — K.square(codings_mean),
+axis=-1,
+)
+)
+variational_ae_beta.add_loss(K.mean(latent_loss) / (window_size * feat))
+variational_ae_beta.compile(
+loss=”binary_crossentropy”,
+optimizer=”adam”, #’rmsprop’
+metrics=[rounded_accuracy],
+)
+# count the number of parameters so we can look at this later
+# when evaluating models
+param_size = “{:0.2e}”.format(
+variational_encoder.count_params() + variational_decoder.count_params()
+)
+# Model Name
+# b : beta value used in model
+# c : number of codings — latent variables
+# l : numer of convolutional layers in encoder (also decoder)
+# f1 : the starting number of filters in the first convolution
+# k1 : kernel size for the first convolution
+# k2 : kernel size for the second convolution
+# d : whether dropout is used when sampling the latent space (either True or False)
+# p : number of parameters in the model (encoder + decoder params)
+# eps : number of epochs
+# pat : patience stopping number
+model_name = (
+“TBVAE-{}:_b={:.2f}_c={}_l={}_f1={}_k1={}_dil={}”
+“_p={}_eps={}_pat={}”.format(
+date_time,
+beta_value,
+codings_size,
+conv_layers,
+start_filter_no,
+kernel_size_1,
+dilations,
+param_size,
+epochs,
+earlystop_patience,
+)
+)
+print(“\n”, model_name, “\n”)
+if compile_model_only == False:
+earlystop_callback = tf.keras.callbacks.EarlyStopping(
+monitor=”val_loss”,
+min_delta=0.0002,
+patience=earlystop_patience,
+restore_best_weights=True,
+verbose=1,
+)
+history = variational_ae_beta.fit(
+X_train_slim,
+X_train_slim,
+epochs=epochs,
+batch_size=1024,
+shuffle=True,
+validation_data=(X_val_slim, X_val_slim),
+callbacks=[earlystop_callback,], # tensorboard_callback,
+verbose=verbose,
+)
+return date_time, model_name, history, variational_ae_beta, variational_encoder
+else:
+return variational_ae_beta, variational_encoder
+
+
+
